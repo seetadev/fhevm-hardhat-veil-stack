@@ -176,11 +176,27 @@
 
         function addImage(string memory name, uint replicas) restricted public {
             bytes32 hashedName = keccak256(abi.encodePacked(name));
-            require(!imageDetails[hashedName].active);
             require(bytes(name).length > 0);
             require(replicas > 0);
-
-            images.push(name);
+            
+            // Check if image already exists
+            bool imageExists = false;
+            for (uint i = 0; i < images.length; i++) {
+                if (keccak256(abi.encodePacked(images[i])) == hashedName) {
+                    imageExists = true;
+                    break;
+                }
+            }
+            
+            // Only push to array if this is a completely new image
+            if (!imageExists) {
+                images.push(name);
+            }
+            
+            // If image was previously active, reactivating it requires it to be inactive first
+            require(!imageDetails[hashedName].active, "Image already active");
+            
+            // Set/reset image details (resets deployed count to 0)
             imageDetails[hashedName] = Image(replicas, 0, true);
 
             // Queue all replicas for sequential deployment
@@ -198,12 +214,51 @@
 
             imageDetails[hashedName].active = false;
 
-            // Reassigns all the affected hosts to new images
+            // Remove all container assignments for this image from all members
             for (uint i = 0; i < members.length; i++) {
-                Member storage member = memberDetails[keccak256(abi.encodePacked(members[i]))];
-                if (member.active && keccak256(abi.encodePacked(member.imageName)) == hashedName) {
+                string memory host = members[i];
+                bytes32 hashedHost = keccak256(abi.encodePacked(host));
+                Member storage member = memberDetails[hashedHost];
+                
+                if (!member.active) {
+                    continue;
+                }
+                
+                // Remove all containers of this image from this member
+                uint containerCount = memberContainerCount[hashedHost];
+                uint newContainerIndex = 0;
+                
+                // Track removed containers for events
+                for (uint j = 0; j < containerCount; j++) {
+                    string memory containerImage = memberContainers[hashedHost][j];
+                    
+                    if (keccak256(abi.encodePacked(containerImage)) == hashedName) {
+                        // This container uses the removed image - emit event and skip it
+                        emit ContainerRemoved(host, name, j);
+                        
+                        // Decrement deployed count
+                        if (imageDetails[hashedName].deployed > 0) {
+                            imageDetails[hashedName].deployed -= 1;
+                        }
+                        
+                        // Clear the slot
+                        delete memberContainers[hashedHost][j];
+                    } else {
+                        // Keep this container - compact the array if needed
+                        if (newContainerIndex != j) {
+                            memberContainers[hashedHost][newContainerIndex] = containerImage;
+                            delete memberContainers[hashedHost][j];
+                        }
+                        newContainerIndex++;
+                    }
+                }
+                
+                // Update container count
+                memberContainerCount[hashedHost] = newContainerIndex;
+                
+                // Update backward-compatible imageName field
+                if (keccak256(abi.encodePacked(member.imageName)) == hashedName) {
                     member.imageName = "";
-                    setImageForMember(members[i]);
                 }
             }
         }
